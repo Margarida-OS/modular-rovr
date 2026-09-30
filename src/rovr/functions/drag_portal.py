@@ -20,7 +20,7 @@ import ctypes
 import os
 import platform
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from functools import lru_cache
 
@@ -32,6 +32,9 @@ _BUS_PATH = "/org/freedesktop/portal/documents"
 _BUS_IFACE = "org.freedesktop.portal.FileTransfer"
 # The session bus caps the number of fds carried by a single message at 16.
 _FD_CHUNK = 16
+# Bounded so a wedged portal cannot hold a worker thread for the libsystemd
+# default of 25 seconds.
+_CALL_TIMEOUT = 5_000_000
 _O_PATH = getattr(os, "O_PATH", 0o10000000)
 
 _P = ctypes.c_void_p
@@ -185,13 +188,43 @@ def _invoke(library: ctypes.CDLL, message: _P) -> _P:
     """
     reply = _P()
     error = _BusError()
-    _check(
-        library.sd_bus_call(_connection(library), message, 0, ctypes.byref(error), ctypes.byref(reply)),
-        error,
-        "portal call",
-    )
-    library.sd_bus_message_unref(message)
+    try:
+        _check(
+            library.sd_bus_call(
+                _connection(library),
+                message,
+                _CALL_TIMEOUT,
+                ctypes.byref(error),
+                ctypes.byref(reply),
+            ),
+            error,
+            "portal call",
+        )
+    finally:
+        # the message is ours until it has gone out, failure included
+        library.sd_bus_message_unref(message)
     return reply
+
+
+def _send(library: ctypes.CDLL, member: str, build: Callable[[_P], None]) -> _P:
+    """Build and send a method call, releasing the message on every path.
+
+    Args:
+        library: The loaded libsystemd.
+        member: The method to call.
+        build: Appends the arguments to the message before it is sent.
+
+    Returns:
+        The reply message, which the caller owns.
+    """
+    message = _new_call(library, member)
+    try:
+        build(message)
+    except BaseException:
+        # _invoke takes over the release once the message is on its way out
+        library.sd_bus_message_unref(message)
+        raise
+    return _invoke(library, message)
 
 
 def _append_string(library: ctypes.CDLL, message: _P, text: str) -> None:
@@ -253,12 +286,17 @@ def _start_transfer(library: ctypes.CDLL) -> str:
     Raises:
         _PortalError: If the portal answered without a key.
     """
-    message = _new_call(library, "StartTransfer")
-    _append_options(library, message)
-    reply = _invoke(library, message)
+
+    def build(message: _P) -> None:
+        _append_options(library, message)
+
+    reply = _send(library, "StartTransfer", build)
     try:
         key = _CHAR_P()
-        if library.sd_bus_message_read(reply, b"s", ctypes.byref(key)) <= 0 or not key.value:
+        if (
+            library.sd_bus_message_read(reply, b"s", ctypes.byref(key)) <= 0
+            or not key.value
+        ):
             raise _PortalError("StartTransfer returned no key")
         return key.value.decode()
     finally:
@@ -273,23 +311,30 @@ def _add_chunk(library: ctypes.CDLL, key: str, descriptors: Sequence[int]) -> No
         key: The session to add the files to.
         descriptors: Open fds for the files, at most ``_FD_CHUNK`` of them.
     """
-    message = _new_call(library, "AddFiles")
-    _append_string(library, message, key)
-    _check(library.sd_bus_message_open_container(message, b"a", b"h"), _BusError(), "open fds")
-    for descriptor in descriptors:
-        _append_fd(library, message, descriptor)
-    _check(library.sd_bus_message_close_container(message), _BusError(), "close fds")
-    _append_options(library, message)
-    library.sd_bus_message_unref(_invoke(library, message))
+
+    def build(message: _P) -> None:
+        _append_string(library, message, key)
+        _check(
+            library.sd_bus_message_open_container(message, b"a", b"h"),
+            _BusError(),
+            "open fds",
+        )
+        for descriptor in descriptors:
+            _append_fd(library, message, descriptor)
+        _check(library.sd_bus_message_close_container(message), _BusError(), "close fds")
+        _append_options(library, message)
+
+    library.sd_bus_message_unref(_send(library, "AddFiles", build))
 
 
-def _add_files(library: ctypes.CDLL, key: str, paths: Sequence[str]) -> None:
-    """Register every dragged path with a session, in batches of open fds.
+def _open_all(paths: Sequence[str]) -> list[int]:
+    """Open every path of a batch, leaving no descriptor behind on failure.
 
     Args:
-        library: The loaded libsystemd.
-        key: The session to add the files to.
-        paths: The files and directories about to be dragged.
+        paths: The files and directories to open.
+
+    Returns:
+        One open descriptor per path.
 
     Raises:
         OSError: If one of the paths disappeared before it could be opened.
@@ -298,11 +343,39 @@ def _add_files(library: ctypes.CDLL, key: str, paths: Sequence[str]) -> None:
     try:
         for path in paths:
             descriptors.append(os.open(path, _O_PATH | os.O_CLOEXEC))
-        for start in range(0, len(descriptors), _FD_CHUNK):
-            _add_chunk(library, key, descriptors[start : start + _FD_CHUNK])
-    finally:
-        for descriptor in descriptors:
-            os.close(descriptor)
+    except OSError:
+        _close_all(descriptors)
+        raise
+    return descriptors
+
+
+def _close_all(descriptors: Sequence[int]) -> None:
+    """Close the descriptors of a batch.
+
+    Args:
+        descriptors: The fds to close, including any half-opened batch.
+    """
+    for descriptor in descriptors:
+        os.close(descriptor)
+
+
+def _add_files(library: ctypes.CDLL, key: str, paths: Sequence[str]) -> None:
+    """Register every dragged path with a session, one batch of fds at a time.
+
+    Only ``_FD_CHUNK`` descriptors are ever open at once, so a drag over a huge
+    selection cannot run the process out of file handles on its own.
+
+    Args:
+        library: The loaded libsystemd.
+        key: The session to add the files to.
+        paths: The files and directories about to be dragged.
+    """
+    for start in range(0, len(paths), _FD_CHUNK):
+        descriptors = _open_all(paths[start : start + _FD_CHUNK])
+        try:
+            _add_chunk(library, key, descriptors)
+        finally:
+            _close_all(descriptors)
 
 
 def _stop_transfer(library: ctypes.CDLL, key: str) -> None:
@@ -312,9 +385,11 @@ def _stop_transfer(library: ctypes.CDLL, key: str) -> None:
         library: The loaded libsystemd.
         key: The session to close.
     """
-    message = _new_call(library, "StopTransfer")
-    _append_string(library, message, key)
-    library.sd_bus_message_unref(_invoke(library, message))
+
+    def build(message: _P) -> None:
+        _append_string(library, message, key)
+
+    library.sd_bus_message_unref(_send(library, "StopTransfer", build))
 
 
 class DragTransfer:

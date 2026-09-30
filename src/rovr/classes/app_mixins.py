@@ -472,10 +472,21 @@ class DragAndDrop:
             # only a cancelled drag is safe to unregister: a target that did
             # drop may still be fetching the files through the portal
             self._dnd_portal_transfer = None
-            transfer.stop()
+            self._stop_portal_transfer(transfer)
         if self._dnd_timer:
             self._dnd_timer[0].stop()
             self._dnd_timer = None
+
+    @work
+    async def _stop_portal_transfer(
+        self: App, transfer: drag_portal.DragTransfer
+    ) -> None:
+        """Unregister a cancelled drag's session without stalling the loop.
+
+        Args:
+            transfer: The session handed out when the drag started.
+        """
+        await asyncio.to_thread(transfer.stop)
 
     @on(events.AppBlur)
     def watch_state(self: App, state: str = "idle") -> None:

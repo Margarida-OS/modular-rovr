@@ -13,7 +13,9 @@ def test_export_is_skipped_for_missing_paths(tmp_path: Path) -> None:
     assert drag_portal.export_files([(tmp_path / "missing.txt").as_posix()]) is None
 
 
-def test_export_is_skipped_off_linux(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_export_is_skipped_off_linux(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     file = tmp_path / "file.txt"
     file.touch()
     monkeypatch.setattr(drag_portal.platform, "system", lambda: "Windows")
