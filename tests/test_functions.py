@@ -201,3 +201,35 @@ async def test_expand_command_tab_highlights(tmp_path: Path) -> None:
 
 async def _empty_selection() -> list[str]:
     return []
+
+
+def test_get_unrar_executable_for_rar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(utils.shutil, "which", lambda _: "/usr/bin/unrar")
+    archive = tmp_path / "archive.rar"
+    assert utils.get_unrar_executable(archive.as_posix()) == "/usr/bin/unrar"
+
+
+def test_get_unrar_executable_for_rar_is_case_insensitive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(utils.shutil, "which", lambda _: "/usr/bin/unrar")
+    archive = tmp_path / "archive.RAR"
+    assert utils.get_unrar_executable(archive.as_posix()) == "/usr/bin/unrar"
+
+
+def test_get_unrar_executable_without_unrar_installed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(utils.shutil, "which", lambda _: None)
+    archive = tmp_path / "archive.rar"
+    assert utils.get_unrar_executable(archive.as_posix()) is None
+
+
+def test_get_unrar_executable_ignores_other_archives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(utils.shutil, "which", lambda _: "/usr/bin/unrar")
+    for name in ("archive.zip", "archive.tar.gz", "archive"):
+        assert utils.get_unrar_executable((tmp_path / name).as_posix()) is None

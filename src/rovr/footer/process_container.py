@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import subprocess
 import sys
 import time
 import zipfile
@@ -27,7 +29,7 @@ from rovr.classes.type_aliases import BarPanicDismissible, BarPanicNotify
 from rovr.functions import icons as icon_utils
 from rovr.functions import path as path_utils
 from rovr.functions.cwd import getcwd
-from rovr.functions.utils import is_being_used, should_cancel
+from rovr.functions.utils import get_unrar_executable, is_being_used, should_cancel
 from rovr.variables.constants import config, scroll_bindings
 
 
@@ -764,6 +766,90 @@ class ProcessContainer(Actionable, VerticalScroll):
 
         bar.ok()
 
+    def extract_unrar_archive(
+        self, unrar: str, archive_path: str, destination_path: str
+    ) -> None:
+        """
+        Extracts a rar archive using unrar, which is much faster than rarfile.
+
+        Args:
+            unrar (str): Path to the unrar executable.
+            archive_path (str): Path to the rar archive.
+            destination_path (str): Path to the destination folder.
+        """
+        bar = self.threaded_new_process_bar(classes="active")
+        self.app.call_from_thread(
+            bar.update_icon,
+            icon_utils.get_icon("general", "open")[0],
+        )
+        self.app.call_from_thread(
+            bar.update_text,
+            "Preparing to extract...",
+        )
+
+        try:
+            if not path.exists(destination_path):
+                os.makedirs(destination_path)
+
+            # the trailing slash tells unrar that the destination is a folder
+            process = subprocess.Popen(
+                [unrar, "x", "-p-", "-y", archive_path, destination_path + os.sep],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                if should_cancel():
+                    process.kill()
+                    process.wait()
+                    return
+                member = self.parse_unrar_progress(line)
+                if member is None:
+                    continue
+                self.app.call_from_thread(bar.update_text, member)
+                self.app.call_from_thread(bar.update_progress, advance=1)
+            return_code = process.wait()
+            if return_code != 0:
+                bar.panic(
+                    dismiss_with={
+                        "message": f"Unzipping failed due to unrar exiting with code {return_code}\nProcess Aborted.",
+                        "subtitle": "If this is a bug, file an issue!",
+                    },
+                    bar_text="Error extracting archive",
+                )
+                return
+        except Exception as exc:
+            path_utils.dump_exc(self, exc)
+            bar.panic(
+                dismiss_with={
+                    "message": f"Unzipping failed due to {type(exc).__name__}\n{exc}\nProcess Aborted.",
+                    "subtitle": "If this is a bug, please file an issue!",
+                },
+                bar_text="Unhandled Error",
+            )
+            return
+
+        bar.ok()
+
+    @staticmethod
+    def parse_unrar_progress(line: str) -> str | None:
+        """
+        Get the name of the extracted file from a line of unrar's output.
+
+        Args:
+            line (str): A line printed by unrar.
+
+        Returns:
+            str | None: The name of the extracted file, or None if the line does not report one.
+        """
+        if not line.startswith("Extracting"):
+            return None
+        match = re.match(r"Extracting\s+(.+?)\s+OK\s*$", line, re.DOTALL)
+        return match.group(1) if match else None
+
     @work(thread=True)
     def extract_archive(self, archive_path: str, destination_path: str) -> None:
         """
@@ -777,6 +863,9 @@ class ProcessContainer(Actionable, VerticalScroll):
             ValueError: If the archive contains unsafe paths that could lead to path traversal vulnerabilities.
                       ╰─ this is automatically caught
         """
+        if unrar := get_unrar_executable(archive_path):
+            self.extract_unrar_archive(unrar, archive_path, destination_path)
+            return
         bar = self.threaded_new_process_bar(classes="active")
         self.app.call_from_thread(
             bar.update_icon,

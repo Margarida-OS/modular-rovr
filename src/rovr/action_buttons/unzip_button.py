@@ -20,7 +20,7 @@ class UnzipButton(Button):
     def __init__(self) -> None:
         super().__init__(get_icon("general", "open")[0], classes="option", id="unzip")
         if config["interface"]["tooltips"]:
-            self.tooltip = "Extract selected archive"
+            self.tooltip = "Extract selected archive (Unzip/Unrar)"
 
     @work(thread=True, exclusive=True, group="unzip-check")
     def update_state(self, paths: list[str]) -> None:

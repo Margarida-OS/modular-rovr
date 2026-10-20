@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import subprocess
 from contextlib import suppress
 from typing import Any, Callable, Literal, cast, overload
@@ -117,6 +118,21 @@ def is_archive(path_str: str) -> bool:
             return True
     except Exception:
         return False
+
+
+def get_unrar_executable(archive_path: str) -> str | None:
+    """
+    Get the unrar executable for a rar archive, if there is one
+
+    Args:
+        archive_path (str): the archive to extract
+
+    Returns:
+        str | None: the path of the unrar executable, or None if it shouldn't be used
+    """
+    if not archive_path.lower().endswith(".rar"):
+        return None
+    return shutil.which("unrar")
 
 
 def get_shortcut(

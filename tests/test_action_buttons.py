@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 from shutil import move
+from unittest.mock import MagicMock
 
 import pytest
 from textual.widgets import OptionList, SelectionList
@@ -432,6 +433,44 @@ async def test_unzip_button_extracts_archive(tmp_path: Path) -> None:
         await iter_until(pilot, lambda: not isinstance(app.screen, ModalInput))
         assert not isinstance(app.screen, ModalInput)
         assert os.path.isdir(tmp_path / "test_archive")
+
+
+@pytest.mark.asyncio
+async def test_unzip_button_extracts_rar_with_unrar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rovr.footer import process_container
+    from rovr.screens import ModalInput
+
+    def fake_unrar(command: list[str], **_kwargs: object) -> MagicMock:
+        assert command[1:4] == ["x", "-p-", "-y"]
+        destination = Path(command[-1])
+        assert destination.parent == tmp_path
+        assert destination.name == "test_archive"
+        destination.mkdir(exist_ok=True)
+        (destination / "dummy.txt").write_text("hello")
+        process = MagicMock()
+        process.stdout = iter(["Extracting  dummy.txt OK\n"])
+        process.wait.return_value = 0
+        return process
+
+    # a minimal rar5 signature, enough for the archive to be recognised
+    (tmp_path / "test_archive.rar").write_bytes(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 64)
+    monkeypatch.setattr(
+        process_container, "get_unrar_executable", lambda _: "/usr/bin/unrar"
+    )
+    monkeypatch.setattr(process_container.subprocess, "Popen", fake_unrar)
+    app = Application(startup_path=tmp_path.as_posix())
+    async with app.run_test(size=(143, 37)) as pilot:
+        await pilot.pause()
+        await pilot.click(UnzipButton)
+        await iter_until(pilot, lambda: isinstance(app.screen, ModalInput))
+        assert isinstance(app.screen, ModalInput)
+        await pilot.press("enter")
+        await iter_until(
+            pilot, lambda: (tmp_path / "test_archive" / "dummy.txt").exists(), 5.0
+        )
+        assert (tmp_path / "test_archive" / "dummy.txt").read_text() == "hello"
 
 
 @pytest.mark.asyncio
