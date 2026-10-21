@@ -4,10 +4,12 @@ from os import path
 from pathlib import Path
 from typing import ClassVar, Generator, cast
 
+from rich.style import Style
 from rich.text import Text
 from textual import events
 from textual.binding import Binding, BindingType
 from textual.css.query import NoMatches
+from textual.strip import Segment, Strip
 from textual.validation import Function
 from textual.widgets import Input
 from textual_autocomplete import DropdownItem, PathAutoComplete, TargetState
@@ -20,6 +22,8 @@ from rovr.functions.icons import get_icon
 from rovr.functions.path import is_hidden_file
 from rovr.functions.utils import check_key
 from rovr.variables.constants import config
+
+path_sep = os.path.sep
 
 
 def get_subdirectories(parent: str | os.PathLike) -> Generator[os.DirEntry, None, None]:
@@ -66,6 +70,49 @@ def should_exclude_hidden(path_str: str) -> bool:
     if not tail:
         return True
     return not tail.startswith(".")
+
+
+def get_path_segments(path_str: str) -> list[tuple[str, str, int, int]]:
+    """Split an absolute path into the clickable parts shown in the path input.
+
+    Every part carries the directory it points at and the character range it
+    occupies in ``path_str``, so a click can be mapped back to a directory.
+
+    Args:
+        path_str: The path currently shown in the path input.
+
+    Returns:
+        A list of ``(label, target, start, end)`` tuples, in display order.
+        Empty when the path has a single component and nothing to click.
+    """
+    tail = path_str[len(path_sep) :].rstrip(path_sep) if path_str else ""
+    if path_sep not in path_str or not tail:
+        return []
+
+    segments: list[tuple[str, str, int, int]] = []
+    start = 0
+    for part in tail.split(path_sep):
+        end = path_str.index(part, start) + len(part)
+        segments.append((part, path_str[:end] or path_sep, start, end))
+        start = end + 1
+    return segments
+
+
+def get_segment_at(segments: list[tuple[str, str, int, int]], index: int) -> str | None:
+    """Get the directory of the path segment at a given character index.
+
+    Args:
+        segments: The segments returned by [get_path_segments][rovr.navigation_widgets.path_input.get_path_segments].
+        index: The character index that was clicked.
+
+    Returns:
+        The directory the clicked segment points at, or None when the click did
+        not land on a segment.
+    """
+    for _, target, start, end in segments:
+        if start <= index < end:
+            return target
+    return None
 
 
 def _unix_get_candidates(path_str: str) -> list[DropdownItem]:
@@ -460,9 +507,84 @@ class PathInput(Actionable, Input, inherit_bindings=False):
             Action(self.action_delete_left, "backspace"),
             Action(self.app.file_list.focus, "escape"),
         ]
+        self.hovered_segment: str | None = None
 
     def on_mount(self) -> None:
         self.auto_completer = self.app.query_one(PathAutoCompleteInput)
+
+    def get_char_index_at(self, x: int) -> int:
+        """Convert a click's x coordinate into an index in the input's value.
+
+        Args:
+            x: The x coordinate of the click, relative to the widget.
+
+        Returns:
+            The index of the character under the cursor.
+        """
+        return x - (self.content_region.x - self.region.x) + self.scroll_offset.x
+
+    def on_click(self, event: events.Click) -> None:
+        target = get_segment_at(
+            get_path_segments(self.value), self.get_char_index_at(event.x)
+        )
+        if target is None:
+            return
+        event.prevent_default().stop()
+        if path.realpath(target) != path.realpath(getcwd()):
+            self.app.cd(target, clear_search=True)
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        self.hovered_segment = get_segment_at(
+            get_path_segments(self.value), self.get_char_index_at(event.x)
+        )
+        self._refresh_hover()
+
+    def _refresh_hover(self) -> None:
+        pointer = "pointer" if self.hovered_segment else None
+        if self.styles.pointer != pointer:
+            self.styles.pointer = pointer
+        self.refresh()
+
+    def on_leave(self) -> None:
+        if self.hovered_segment is not None:
+            self.hovered_segment = None
+            self._refresh_hover()
+
+    def render_line(self, y: int) -> Strip:
+        strip = super().render_line(y)
+        if y != 0 or not self.hovered_segment or not self.value:
+            return strip
+        offset = -self.scroll_offset.x
+        ranges = [
+            (offset + start, offset + end)
+            for _, target, start, end in get_path_segments(self.value)
+            if target == self.hovered_segment
+        ]
+        if not ranges:
+            return strip
+        hover_style = Style(
+            color=self.get_component_rich_style("input--cursor").color,
+            underline=True,
+        )
+        start, end = ranges[0]
+        segments = []
+        position = 0
+        for segment in strip:
+            segment_end = position + segment.cell_length
+            overlap_start = max(position, start)
+            overlap_end = min(segment_end, end)
+            if overlap_start >= overlap_end or segment.style is None:
+                segments.append(segment)
+            else:
+                head, rest = segment.split_cells(overlap_start - position)
+                body, tail = rest.split_cells(overlap_end - overlap_start)
+                segments.extend((
+                    head,
+                    Segment(body.text, segment.style + hover_style),
+                    tail,
+                ))
+            position = segment_end
+        return Strip([segment for segment in segments if segment.text], strip.cell_length)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Use a custom path entered as the current working directory"""

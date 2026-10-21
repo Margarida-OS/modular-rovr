@@ -1107,6 +1107,7 @@ class Application(
             self.file_list.focus()
         else:
             path_switcher.focus()
+            path_switcher.cursor_position = len(path_switcher.value)
 
     def action_focus_toggle_processes(self) -> None:
         if (
